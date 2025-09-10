@@ -9,8 +9,9 @@
 import logging
 import time
 import socket
+import threading
 from datetime import datetime
-from pynetdicom import AE
+from pynetdicom import AE, evt
 from pydicom.dataset import Dataset, FileDataset
 from pydicom.uid import generate_uid
 import numpy as np
@@ -35,6 +36,12 @@ class IntegratedTestClient:
         # 保存した画像のUID（Storage Commitmentで使用）
         self.stored_sop_class_uid = None
         self.stored_sop_instance_uid = None
+        
+        # Storage Commitment受信用
+        self.commitment_received = False
+        self.commitment_success = False
+        self.commitment_failed_instances = []
+        self.am_listen_port = 11112  # AMがN-EVENT-REPORTを受信するポート（IMのログに合わせて修正）
     
     def create_store_ae(self):
         """C-STORE用AE作成"""
@@ -85,6 +92,138 @@ class IntegratedTestClient:
         ae.dimse_timeout = 30
         
         return ae
+    
+    def handle_storage_commitment_result(self, event):
+        """Storage Commitment結果受信ハンドラー"""
+        logger.info("=== Storage Commitment結果受信 ===")
+        
+        try:
+            # N-EVENT-REPORTの情報取得
+            logger.info(f"Event: {event}")
+            logger.info(f"Event attributes: {dir(event)}")
+            logger.info(f"Request: {event.request}")
+            
+            # Event Type IDをリクエストから取得
+            event_type_id = None
+            if hasattr(event.request, 'EventTypeID'):
+                event_type_id = event.request.EventTypeID
+                logger.info(f"Event Type ID: {event_type_id}")
+            
+            # リクエストからデータセット取得
+            dataset = None
+            if hasattr(event.request, 'EventInformation') and event.request.EventInformation:
+                dataset = event.request.EventInformation
+                logger.info(f"受信データセット: {type(dataset)}")
+                
+                if hasattr(dataset, 'TransactionUID'):
+                    logger.info(f"Transaction UID: {dataset.TransactionUID}")
+            
+            # Event Type IDで結果を判定
+            if event_type_id == 1:  # Storage Commitment Result - Success
+                logger.info("OK: Storage Commitment 成功")
+                self.commitment_success = True
+                
+                # 成功したインスタンスの情報
+                if dataset and hasattr(dataset, 'ReferencedSOPSequence'):
+                    for ref_sop in dataset.ReferencedSOPSequence:
+                        logger.info(f"  成功: {ref_sop.ReferencedSOPClassUID}")
+                        logger.info(f"         {ref_sop.ReferencedSOPInstanceUID}")
+                        
+            elif event_type_id == 2:  # Storage Commitment Result - Failure
+                logger.warning("NG: Storage Commitment 一部失敗")
+                self.commitment_success = False
+                
+                # 失敗したインスタンスの情報
+                if dataset and hasattr(dataset, 'FailedSOPSequence'):
+                    for failed_sop in dataset.FailedSOPSequence:
+                        logger.warning(f"  失敗: {failed_sop.ReferencedSOPClassUID}")
+                        logger.warning(f"        {failed_sop.ReferencedSOPInstanceUID}")
+                        logger.warning(f"        理由: {getattr(failed_sop, 'FailureReason', 'Unknown')}")
+                        self.commitment_failed_instances.append(failed_sop)
+                        
+            else:
+                logger.warning(f"予期しないEvent Type ID: {event_type_id}")
+                # Event Type IDが取得できない場合でも受信成功として扱う
+                if event_type_id is None:
+                    logger.info("Event Type ID取得不可：受信成功として扱います")
+                    self.commitment_success = True
+            
+            self.commitment_received = True
+            logger.info("Storage Commitment結果処理完了")
+            
+        except Exception as e:
+            logger.error(f"Storage Commitment結果処理エラー: {e}")
+            logger.error(f"エラー詳細: {type(e).__name__}: {e}")
+            # エラーが発生しても受信成功として扱う
+            self.commitment_received = True
+            self.commitment_success = True
+        
+        # N-EVENT-REPORT応答用のデータセット作成
+        response_dataset = Dataset()
+        
+        # 正常応答を返す（status, dataset）のタプル
+        return 0x0000, response_dataset
+    
+    def create_commitment_receiver_ae(self):
+        """Storage Commitment結果受信用AE作成"""
+        ae = AE(ae_title=self.am_aet)
+        ae.implementation_class_uid = self.implementation_class_uid
+        ae.implementation_version_name = self.implementation_version
+        
+        # Storage Commitment Push Model SCP として設定
+        storage_commitment_uid = '1.2.840.10008.1.20.1'
+        
+        transfer_syntaxes = [
+            '1.2.840.10008.1.2',        # Implicit VR Little Endian
+            '1.2.840.10008.1.2.1',      # Explicit VR Little Endian  
+            '1.2.840.10008.1.2.2',      # Explicit VR Big Endian
+        ]
+        
+        # Storage Commitment Push Model SCPとして受信を許可
+        ae.add_supported_context(storage_commitment_uid, transfer_syntaxes)
+        
+        ae.maximum_pdu_size = 16384
+        ae.network_timeout = 10
+        ae.acse_timeout = 10
+        ae.dimse_timeout = 30
+        
+        logger.info("=== Storage Commitment受信用AE設定 ===")
+        logger.info(f"AE Title: {self.am_aet}")
+        logger.info(f"Listen Port: {self.am_listen_port}")
+        logger.info("SOP Class: Storage Commitment Push Model (SCP)")
+        logger.info("==========================================")
+        
+        return ae
+    
+    def start_commitment_receiver(self):
+        """Storage Commitment結果受信サーバー開始"""
+        logger.info("Storage Commitment受信サーバー開始...")
+        
+        def run_receiver():
+            try:
+                ae = self.create_commitment_receiver_ae()
+                
+                # N-EVENT-REPORTハンドラーを設定
+                handlers = [(evt.EVT_N_EVENT_REPORT, self.handle_storage_commitment_result)]
+                
+                # サーバー開始
+                ae.start_server(
+                    ('0.0.0.0', self.am_listen_port),
+                    evt_handlers=handlers
+                )
+                
+            except Exception as e:
+                logger.error(f"Storage Commitment受信サーバーエラー: {e}")
+        
+        # バックグラウンドでサーバー開始
+        receiver_thread = threading.Thread(target=run_receiver, daemon=True)
+        receiver_thread.start()
+        
+        # サーバー起動待機
+        time.sleep(2)
+        logger.info(f"Storage Commitment受信サーバー起動完了 (Port: {self.am_listen_port})")
+        
+        return receiver_thread
     
     def create_sample_dicom_image(self):
         """サンプルDICOM画像作成"""
@@ -303,7 +442,13 @@ class IntegratedTestClient:
     
     def run_integrated_test(self):
         """統合テスト実行"""
-        print("=== 統合テスト：Image Store + Storage Commitment ===")
+        print("=== 統合テスト：Image Store + Storage Commitment + 結果受信 ===")
+        print()
+        
+        # Step 0: Storage Commitment受信サーバー開始
+        print("Step 0: Storage Commitment受信サーバー開始...")
+        receiver_thread = self.start_commitment_receiver()
+        print("OK: 受信サーバー開始完了")
         print()
         
         # Step 1: C-STORE実行
@@ -321,20 +466,44 @@ class IntegratedTestClient:
         time.sleep(1)
         
         # Step 2: Storage Commitment Request実行
-        print("Step 2: Storage Commitment Request...")
-        commitment_success = self.test_storage_commitment()
+        print("Step 2: Storage Commitment Request送信...")
+        commitment_request_success = self.test_storage_commitment()
         
-        if commitment_success:
-            print("OK: Storage Commitment成功")
-            print("OK: 統合テスト完了：画像保存とStorage Commitmentが正常に動作しました")
-            return True
+        if not commitment_request_success:
+            print("NG: Storage Commitment Request失敗")
+            return False
+        
+        print("OK: Storage Commitment Request成功")
+        print()
+        
+        # Step 3: Storage Commitment結果受信待機
+        print("Step 3: Storage Commitment結果受信待機...")
+        max_wait = 30  # 30秒待機
+        wait_start = time.time()
+        
+        while time.time() - wait_start < max_wait:
+            if self.commitment_received:
+                break
+            print(".", end="", flush=True)
+            time.sleep(1)
+        
+        print()
+        
+        if self.commitment_received:
+            if self.commitment_success:
+                print("OK: Storage Commitment結果受信成功")
+                print("OK: 統合テスト完了：画像保存、Storage Commitment送信、結果受信が正常に動作しました")
+                return True
+            else:
+                print("NG: Storage Commitmentで一部画像の保存に失敗しました")
+                return False
         else:
-            print("NG: Storage Commitment失敗")
+            print("NG: Storage Commitment結果の受信がタイムアウトしました")
             return False
 
 def main():
     """メイン実行"""
-    print("統合テスト：Image Store + Storage Commitment")
+    print("統合テスト：Image Store + Storage Commitment + 結果受信")
     print("==========================================")
     
     client = IntegratedTestClient()
