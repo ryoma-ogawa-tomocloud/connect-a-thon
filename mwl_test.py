@@ -57,7 +57,7 @@ def create_simple_mwl_query():
     sps_item = Dataset()
     
     # OFサーバーが要求する必須フィールドに値を設定
-    sps_item.Modality = "CR"  # ← 必須: 空でなく具体的な値
+    sps_item.Modality = "OT"  # ← 必須: 空でなく具体的な値
     sps_item.ScheduledStationAETitle = "LTMONITOR"
     
     # 日付を具体的に設定（今日の日付）
