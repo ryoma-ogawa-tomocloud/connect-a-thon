@@ -38,6 +38,10 @@ def create_simple_mwl_query():
     """シンプルなMWLクエリ作成（OFサーバー互換）"""
     ds = Dataset()
     
+    # 文字セット指定（日本語対応）- OFサーバーが要求するタグ
+    # 成功したオプション1のみを使用
+    ds.SpecificCharacterSet = ['ISO 2022 IR 6', 'ISO 2022 IR 87']  # ASCII + JIS X 0208
+    
     # 患者情報（検索条件）
     ds.PatientName = "*"  # ワイルドカード検索
     ds.PatientID = "*"    # ワイルドカード検索
@@ -68,6 +72,7 @@ def create_simple_mwl_query():
     ds.ScheduledProcedureStepSequence = [sps_item]
     
     print(f"作成したMWLクエリ:")
+    print(f"  SpecificCharacterSet: {ds.SpecificCharacterSet}")
     print(f"  Modality: {sps_item.Modality}")
     print(f"  ScheduledProcedureStepStartDate: {sps_item.ScheduledProcedureStepStartDate}")
     print(f"  PatientName: {ds.PatientName}")
