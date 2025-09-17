@@ -44,9 +44,6 @@ venv.bak/
 # pyenv
 .python-version
 
-# Logs
-*.log
-logs/
 
 # DICOM files
 *.dcm
